@@ -1,7 +1,17 @@
 
+'''
+该模块主要处理http://www.cnvd.org.cn
+
+解析统计查询中的共享数据xml
+'''
 
 import os
+from queue import Queue
+from datetime import datetime
+import threading
+
 import requests
+from bs4 import BeautifulSoup
 # import pytesseract
 # from PIL import Image
 import pandas as pd
@@ -103,22 +113,175 @@ class CNVD:
 #     return image
 
 
+def xml2df(df,p=''):
+    '''
+    @author： cj
+    @date: 20190225
+    @函数：xml2df
+    @参数：q:xml文件路径
+    @描述：漏洞平台共享xml解析
+    @返回：df表
+    @示例：a=@udf CNVD.xml2df with q
+    '''
+    rootpath = '/opt/openfea/workspace'
+    path = os.path.join(rootpath,p.strip())
+
+    if not os.path.exists(path):
+        raise Exception('文件不存在!')
+
+    tree = ET.ElementTree(file=path)
+    root = tree.getroot()
+
+    result = []
+    keys = set()
+    for e in root:
+        d = {}
+        df2dict(e,d)
+        keys |= set(d.keys())
+        result.append(d)
+    return pd.DataFrame(result,columns=keys)
+
+
+def df2dict(node,rdict):
+    if len(node) > 0:
+        for element in node:
+            df2dict(element,rdict)
+    else:
+        _key = node.tag
+        _text = node.text.strip()
+        if _key in rdict:
+            _value = rdict[_key]
+            if isinstance(_value,list):
+                rdict[_key].append(_text)
+            else:
+                rdict[_key] = [_value,_text]
+        else:
+            rdict[_key] = _text
+
+
+
+
+
+class CNVD_spider:
+    VULN_ID = {
+        '27': '操作系统漏洞',
+        '28': '应用程序漏洞',
+        '29': 'WEB应用漏洞',
+        '30': '数据库漏洞',
+        '31': '网络设备漏洞',
+        '32': '安全产品漏洞',
+
+    }
+    HEADERS = {
+        'Host': 'www.cnvd.org.cn',
+        'Connection': 'keep-alive',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/72.0.3626.109 Safari/537.36',
+        'Accept-Encoding': 'gzip, deflate',
+        'Accept-Language': 'zh-CN,zh;q=0.9'
+    }
+
+    def __init__(self,vid,start,end):
+        self.vid = vid
+        self.start = self.str2datetime(start)
+        self.end = self.str2datetime(end)
+
+        # 返回条数
+        self.max = 100
+        # get_detail_urls中的访问次数
+        self.count = 0
+
+        # 这边开5个线程
+        self.thread_num = 5
+        self.session = requests.Session()
+        self.vuln_urls = Queue()
+
+    def str2datetime(self,s):
+        if isinstance(s,str):
+            if '-' in s:
+                fmt = '%Y-%m-%d'
+            else:
+                fmt = '%Y%m%d'
+            return datetime.strptime(s,fmt)
+        elif isinstance(s,datetime):
+            return s
+
+    def get_detail_urls(self):
+        url = 'http://www.cnvd.org.cn/flaw/typeResult?typeId=%s&max=%s&offset=%s'%(self.vid,self.max,self.max*self.count)
+        while True:
+            html = self.session.post(url=url, headers=self.HEADERS).text
+            # 同一个http请求10次会触发反爬,因此这边重建连接
+            if not html:
+                self.session = requests.Session()
+                continue
+            soup = BeautifulSoup(html, "html.parser")
+            tbody = soup.find('tbody').find_all('tr')
+            try:
+                for tr in tbody:
+                    publish_time = tr.find_all('td')[-1].text.strip()
+                    if publish_time:
+                        publish_time_date = self.str2datetime(publish_time)
+                        if publish_time_date >= self.start:
+                            if publish_time_date <= self.end:
+                                vuln_url = tr.td.find('a').get('href')
+                                if vuln_url:
+                                    self.vuln_urls.put('http://www.cnvd.org.cn'+vuln_url)
+                        else:
+                            break
+                else:
+                    self.count += 1
+                    self.get_detail_urls()
+            except:
+                raise Exception('出错')
+            else:
+                break
+
+    def get_detail_info(self,session,result):
+        while not self.vuln_urls.empty():
+            url = self.vuln_urls.get()
+            while True:
+                html = session.get(url=url,headers=self.HEADERS).text
+                # 同一个http请求10次会触发反爬,因此这边重建连接
+                if not html:
+                    session = requests.Session()
+                    continue
+                soup = BeautifulSoup(html,"html.parser")
+                try:
+                    vuln_title = soup.find(class_='blkContainerSblk').h1.text
+                    d = {'title':vuln_title,'type':self.VULN_ID[self.vid]}
+                    tbody = soup.find('tbody').find_all('tr')
+                    for tr in tbody[:-2]:
+                        tds = tr.find_all('td')
+                        key = tds[0].text.strip()
+                        value = tds[1].text.strip()
+                        # 这边字符串要特殊处理
+                        if key == '危害级别':
+                            value = value.split()[0].strip()
+                        d[key] = value
+                    result.append(d)
+                    break
+                except:
+                    raise Exception('出错')
+            self.vuln_urls.task_done()
+        return result
+
+    def run(self,r):
+        threads = []
+        for _ in range(self.thread_num):
+            t = threading.Thread(target=self.get_detail_info,args=(requests.Session(),r))
+            threads.append(t)
+
+        for i in threads:
+            i.start()
+
+        for i in threads:
+            i.join()
+
+        self.vuln_urls.join()
 
 
 if __name__=='__main__':
-    path = '/Users/yasina/Downloads/2019-02-04_2019-02-10.xml'
-    # tree = ET.ElementTree(file=path)
-    # root = tree.getroot()
-    # result = []
-    # for i in root:
-    #     d = {}
-    #     df2dict(i,d)
-    #     print(list(d.keys()))
-    # print(result)
-    # email = '614867000@qq.com'
-    # password = 'oPxGqC80A71jW4MjmKduvA=='
-    # cnvd = CNVD(email,password)
-    # cnvd.set_session().download_code()
-    # cnvd.do_login()
-    # img = convert_Image(Image.open('bb.jpg'))
-    # code = pytesseract.image_to_string(img)
+    r = []
+    cnvd = CNVD_spider('31','20190222','20190227')
+    cnvd.get_detail_urls()
+    cnvd.run(r)
+    print(r)
